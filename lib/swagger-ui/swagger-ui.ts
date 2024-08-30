@@ -1,5 +1,5 @@
-import { favIconHtml, htmlTemplateString, jsTemplateString } from './constants';
 import { OpenAPIObject, SwaggerCustomOptions } from '../interfaces';
+import { favIconHtml, htmlTemplateString, jsTemplateString } from './constants';
 import { buildJSInitOptions } from './helpers';
 
 /**
@@ -66,7 +66,6 @@ function toTags(
  */
 export function buildSwaggerHTML(
   baseUrl: string,
-  swaggerDoc: OpenAPIObject,
   customOptions: SwaggerCustomOptions = {}
 ) {
   const {
