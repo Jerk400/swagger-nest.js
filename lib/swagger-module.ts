@@ -8,6 +8,7 @@ import {
   SwaggerCustomOptions,
   SwaggerDocumentOptions
 } from './interfaces';
+import { MetadataLoader } from './plugin/metadata-loader';
 import { SwaggerScanner } from './swagger-scanner';
 import {
   buildSwaggerHTML,
@@ -16,11 +17,14 @@ import {
 } from './swagger-ui';
 import { assignTwoLevelsDeep } from './utils/assign-two-levels-deep';
 import { getGlobalPrefix } from './utils/get-global-prefix';
-import { validatePath } from './utils/validate-path.util';
 import { normalizeRelPath } from './utils/normalize-rel-path';
+import { resolvePath } from './utils/resolve-path.util';
 import { validateGlobalPrefix } from './utils/validate-global-prefix.util';
+import { validatePath } from './utils/validate-path.util';
 
 export class SwaggerModule {
+  private static readonly metadataLoader = new MetadataLoader();
+
   public static createDocument(
     app: INestApplication,
     config: Omit<OpenAPIObject, 'paths'>,
@@ -43,21 +47,35 @@ export class SwaggerModule {
     };
   }
 
-  private static serveStatic(finalPath: string, app: INestApplication) {
+  public static async loadPluginMetadata(
+    metadataFn: () => Promise<Record<string, any>>
+  ) {
+    const metadata = await metadataFn();
+    return this.metadataLoader.load(metadata);
+  }
+
+  private static serveStatic(
+    finalPath: string,
+    app: INestApplication,
+    customStaticPath?: string
+  ) {
     const httpAdapter = app.getHttpAdapter();
-    const swaggerAssetsAbsoluteFSPath = getSwaggerAssetsAbsoluteFSPath();
+
+    // See <https://github.com/nestjs/swagger/issues/2543>
+    const swaggerAssetsPath = customStaticPath
+      ? resolvePath(customStaticPath)
+      : getSwaggerAssetsAbsoluteFSPath();
 
     if (httpAdapter && httpAdapter.getType() === 'fastify') {
       (app as NestFastifyApplication).useStaticAssets({
-        root: swaggerAssetsAbsoluteFSPath,
+        root: swaggerAssetsPath,
         prefix: finalPath,
         decorateReply: false
       });
     } else {
-      (app as NestExpressApplication).useStaticAssets(
-        swaggerAssetsAbsoluteFSPath,
-        { prefix: finalPath }
-      );
+      (app as NestExpressApplication).useStaticAssets(swaggerAssetsPath, {
+        prefix: finalPath
+      });
     }
   }
 
@@ -65,20 +83,74 @@ export class SwaggerModule {
     finalPath: string,
     urlLastSubdirectory: string,
     httpAdapter: HttpServer,
-    swaggerInitJS: string,
+    documentOrFactory: OpenAPIObject | (() => OpenAPIObject),
     options: {
-      html: string;
-      yamlDocument: string;
-      jsonDocument: string;
+      swaggerUiEnabled: boolean;
       jsonDocumentUrl: string;
       yamlDocumentUrl: string;
+      swaggerOptions: SwaggerCustomOptions;
     }
   ) {
+    let document: OpenAPIObject;
+
+    const getBuiltDocument = () => {
+      if (!document) {
+        document =
+          typeof documentOrFactory === 'function'
+            ? documentOrFactory()
+            : documentOrFactory;
+      }
+      return document;
+    };
+
+    if (options.swaggerUiEnabled) {
+      this.serveSwaggerUi(
+        finalPath,
+        urlLastSubdirectory,
+        httpAdapter,
+        getBuiltDocument,
+        options.swaggerOptions
+      );
+    }
+    this.serveDefinitions(httpAdapter, getBuiltDocument, options);
+  }
+
+  private static serveSwaggerUi(
+    finalPath: string,
+    urlLastSubdirectory: string,
+    httpAdapter: HttpServer,
+    getBuiltDocument: () => OpenAPIObject,
+    swaggerOptions: SwaggerCustomOptions
+  ) {
+    const baseUrlForSwaggerUI = normalizeRelPath(`./${urlLastSubdirectory}/`);
+
+    let swaggerUiHtml: string;
+    let swaggerUiInitJS: string;
+
     httpAdapter.get(
       normalizeRelPath(`${finalPath}/swagger-ui-init.js`),
       (req, res) => {
         res.type('application/javascript');
-        res.send(swaggerInitJS);
+        const document = getBuiltDocument();
+
+        if (swaggerOptions.patchDocumentOnRequest) {
+          const documentToSerialize = swaggerOptions.patchDocumentOnRequest(
+            req,
+            res,
+            document
+          );
+          const swaggerInitJsPerRequest = buildSwaggerInitJS(
+            documentToSerialize,
+            swaggerOptions
+          );
+          return res.send(swaggerInitJsPerRequest);
+        }
+
+        if (!swaggerUiInitJS) {
+          swaggerUiInitJS = buildSwaggerInitJS(document, swaggerOptions);
+        }
+
+        res.send(swaggerUiInitJS);
       }
     );
 
@@ -93,7 +165,26 @@ export class SwaggerModule {
         ),
         (req, res) => {
           res.type('application/javascript');
-          res.send(swaggerInitJS);
+          const document = getBuiltDocument();
+
+          if (swaggerOptions.patchDocumentOnRequest) {
+            const documentToSerialize = swaggerOptions.patchDocumentOnRequest(
+              req,
+              res,
+              document
+            );
+            const swaggerInitJsPerRequest = buildSwaggerInitJS(
+              documentToSerialize,
+              swaggerOptions
+            );
+            return res.send(swaggerInitJsPerRequest);
+          }
+
+          if (!swaggerUiInitJS) {
+            swaggerUiInitJS = buildSwaggerInitJS(document, swaggerOptions);
+          }
+
+          res.send(swaggerUiInitJS);
         }
       );
     } catch (err) {
@@ -103,16 +194,26 @@ export class SwaggerModule {
        */
     }
 
-    httpAdapter.get(finalPath, (req, res) => {
+    httpAdapter.get(finalPath, (_, res) => {
       res.type('text/html');
-      res.send(options.html);
+
+      if (!swaggerUiHtml) {
+        swaggerUiHtml = buildSwaggerHTML(baseUrlForSwaggerUI, swaggerOptions);
+      }
+
+      res.send(swaggerUiHtml);
     });
 
     // fastify doesn't resolve 'routePath/' -> 'routePath', that's why we handle it manually
     try {
-      httpAdapter.get(normalizeRelPath(`${finalPath}/`), (req, res) => {
+      httpAdapter.get(normalizeRelPath(`${finalPath}/`), (_, res) => {
         res.type('text/html');
-        res.send(options.html);
+
+        if (!swaggerUiHtml) {
+          swaggerUiHtml = buildSwaggerHTML(baseUrlForSwaggerUI, swaggerOptions);
+        }
+
+        res.send(swaggerUiHtml);
       });
     } catch (err) {
       /**
@@ -122,22 +223,48 @@ export class SwaggerModule {
        * We can simply ignore that error here.
        */
     }
+  }
 
+  private static serveDefinitions(
+    httpAdapter: HttpServer,
+    getBuiltDocument: () => OpenAPIObject,
+    options: {
+      jsonDocumentUrl: string;
+      yamlDocumentUrl: string;
+      swaggerOptions: SwaggerCustomOptions;
+    }
+  ) {
     httpAdapter.get(normalizeRelPath(options.jsonDocumentUrl), (req, res) => {
       res.type('application/json');
-      res.send(options.jsonDocument);
+      const document = getBuiltDocument();
+
+      const documentToSerialize = options.swaggerOptions.patchDocumentOnRequest
+        ? options.swaggerOptions.patchDocumentOnRequest(req, res, document)
+        : document;
+
+      res.send(JSON.stringify(documentToSerialize));
     });
 
     httpAdapter.get(normalizeRelPath(options.yamlDocumentUrl), (req, res) => {
       res.type('text/yaml');
-      res.send(options.yamlDocument);
+      const document = getBuiltDocument();
+
+      const documentToSerialize = options.swaggerOptions.patchDocumentOnRequest
+        ? options.swaggerOptions.patchDocumentOnRequest(req, res, document)
+        : document;
+
+      const yamlDocument = jsyaml.dump(documentToSerialize, {
+        skipInvalid: true,
+        noRefs: true
+      });
+      res.send(yamlDocument);
     });
   }
 
   public static setup(
     path: string,
     app: INestApplication,
-    document: OpenAPIObject,
+    documentOrFactory: OpenAPIObject | (() => OpenAPIObject),
     options?: SwaggerCustomOptions
   ) {
     const globalPrefix = getGlobalPrefix(app);
@@ -146,11 +273,7 @@ export class SwaggerModule {
         ? `${globalPrefix}${validatePath(path)}`
         : path
     );
-    const urlLastSubdirectory = finalPath.split('/').slice(-1).pop();
-
-    const yamlDocument = jsyaml.dump(document, { skipInvalid: true });
-    const jsonDocument = JSON.stringify(document);
-
+    const urlLastSubdirectory = finalPath.split('/').slice(-1).pop() || '';
     const validatedGlobalPrefix =
       options?.useGlobalPrefix && validateGlobalPrefix(globalPrefix)
         ? validatePath(globalPrefix)
@@ -164,38 +287,37 @@ export class SwaggerModule {
       ? `${validatedGlobalPrefix}${validatePath(options.yamlDocumentUrl)}`
       : `${finalPath}-yaml`;
 
-    const baseUrlForSwaggerUI = normalizeRelPath(`./${urlLastSubdirectory}/`);
+    const swaggerUiEnabled = options?.swaggerUiEnabled ?? true;
 
-    const html = buildSwaggerHTML(baseUrlForSwaggerUI, document, options);
-    const swaggerInitJS = buildSwaggerInitJS(document, options);
     const httpAdapter = app.getHttpAdapter();
 
     SwaggerModule.serveDocuments(
       finalPath,
       urlLastSubdirectory,
       httpAdapter,
-      swaggerInitJS,
+      documentOrFactory,
       {
-        html,
-        yamlDocument,
-        jsonDocument,
+        swaggerUiEnabled,
         jsonDocumentUrl: finalJSONDocumentPath,
-        yamlDocumentUrl: finalYAMLDocumentPath
+        yamlDocumentUrl: finalYAMLDocumentPath,
+        swaggerOptions: options || {}
       }
     );
 
-    SwaggerModule.serveStatic(finalPath, app);
-    /**
-     * Covers assets fetched through a relative path when Swagger url ends with a slash '/'.
-     * @see https://github.com/nestjs/swagger/issues/1976
-     */
-    const serveStaticSlashEndingPath = `${finalPath}/${urlLastSubdirectory}`;
-    /**
-     *  serveStaticSlashEndingPath === finalPath when path === '' || path === '/'
-     *  in that case we don't need to serve swagger assets on extra sub path
-     */
-    if (serveStaticSlashEndingPath !== finalPath) {
-      SwaggerModule.serveStatic(serveStaticSlashEndingPath, app);
+    if (swaggerUiEnabled) {
+      SwaggerModule.serveStatic(finalPath, app, options?.customSwaggerUiPath);
+      /**
+       * Covers assets fetched through a relative path when Swagger url ends with a slash '/'.
+       * @see https://github.com/nestjs/swagger/issues/1976
+       */
+      const serveStaticSlashEndingPath = `${finalPath}/${urlLastSubdirectory}`;
+      /**
+       *  serveStaticSlashEndingPath === finalPath when path === '' || path === '/'
+       *  in that case we don't need to serve swagger assets on extra sub path
+       */
+      if (serveStaticSlashEndingPath !== finalPath) {
+        SwaggerModule.serveStatic(serveStaticSlashEndingPath, app);
+      }
     }
   }
 }
